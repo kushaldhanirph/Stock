@@ -282,8 +282,15 @@ def _fetch_one(t: str):
         return None
 
 
+# Bump this whenever the shape of the record dict in _fetch_one changes
+# (new/renamed/removed columns). Passing it into fetch_data's cache key
+# guarantees Streamlit invalidates any old cached results automatically,
+# instead of silently reusing a DataFrame with a different schema.
+DATA_SCHEMA_VERSION = 2
+
+
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)  # refresh every 12 hours
-def fetch_data(tickers: tuple, max_workers: int = 12):
+def fetch_data(tickers: tuple, max_workers: int = 12, schema_version: int = DATA_SCHEMA_VERSION):
     """Fetch fundamentals for all tickers in parallel (much faster than
     one-by-one, which matters once the universe is 100-500+ stocks)."""
     records = []
@@ -387,6 +394,25 @@ st.caption(
 
 with st.spinner("লাইভ ডেটা আনা হচ্ছে... (প্রথমবার একটু সময় লাগতে পারে)"):
     df = fetch_data(tickers)
+
+# Safety net: if a stale/partial cache ever slips through with a
+# different shape than expected (e.g. right after a code update), patch
+# in any missing columns instead of crashing the whole app.
+_expected_cols = {
+    "Cap Category": "N/A", "Market Cap (₹ Cr)": None, "Verdict": "🟡 হোল্ড করুন (Hold Zone)",
+    "Graham Value (₹)": None, "Margin of Safety (%)": None, "ROE (%)": None,
+    "D/E": None, "P/E": None, "P/B": None, "Sector": "N/A",
+}
+if not df.empty:
+    missing = [c for c in _expected_cols if c not in df.columns]
+    if missing:
+        st.cache_data.clear()
+        for c in missing:
+            df[c] = _expected_cols[c]
+        st.warning(
+            "পুরনো cache-এ ডেটার গঠন মিলছিল না, তাই cache মুছে ফেলা হয়েছে। "
+            "পেজটা একবার রিফ্রেশ (Ctrl/Cmd+R) করলে সম্পূর্ণ সঠিক ডেটা দেখাবে।"
+        )
 
 st.info(
     f"📋 এখন সিলেক্টেড ইউনিভার্স: **{universe_choice}** — লিস্টে মোট **{len(tickers)}**টি টিকার ছিল, "
