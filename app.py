@@ -78,6 +78,35 @@ def fetch_index_constituents(universe: str):
         return None
 
 
+NSE_FULL_LIST_URL = "https://archives.nseindia.com/content/equity/EQUITY_L.csv"
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def fetch_full_nse_list():
+    """Download NSE's complete list of listed equities (Series = EQ), the
+    closest free equivalent to 'every NSE stock' (~2000 names). Returns
+    None on failure so the caller can fall back to the bundled list.
+    Note: BSE does not publish an equally stable free full-list feed
+    (its old Bhavcopy format was discontinued in July 2024 and replaced
+    with a link that changes daily), so a reliable 'all BSE stocks'
+    option isn't offered here — see the README for details.
+    """
+    try:
+        session = requests.Session()
+        session.headers.update(NSE_HEADERS)
+        session.get("https://www.nseindia.com", timeout=10)
+        resp = session.get(NSE_FULL_LIST_URL, timeout=15)
+        resp.raise_for_status()
+        df = pd.read_csv(io.StringIO(resp.text))
+        df.columns = [c.strip().upper() for c in df.columns]
+        if "SERIES" in df.columns:
+            df = df[df["SERIES"].astype(str).str.strip() == "EQ"]
+        symbols = df["SYMBOL"].dropna().astype(str).str.strip()
+        return sorted(f"{s}.NS" for s in symbols if s)
+    except Exception:
+        return None
+
+
 # ----------------------------------------------------------------------
 # Fallback watchlist — used only if the live NSE fetch above fails
 # (e.g. NSE temporarily blocking the request). Users can also switch to
@@ -250,8 +279,8 @@ st.sidebar.header("⚙️ Settings")
 
 universe_choice = st.sidebar.selectbox(
     "স্টক ইউনিভার্স (কতগুলো স্টক স্ক্যান করবে)",
-    ["Nifty 50", "Nifty 100", "Nifty 200", "Nifty 500", "Custom (নিজে লিখুন)"],
-    index=3,  # default: Nifty 500 — the broadest practical free universe
+    ["Nifty 50", "Nifty 100", "Nifty 200", "Nifty 500", "NSE - সব স্টক (Full ~2000, ধীর)", "Custom (নিজে লিখুন)"],
+    index=3,  # default: Nifty 500 — the broadest FAST practical universe
 )
 
 if universe_choice == "Custom (নিজে লিখুন)":
@@ -262,6 +291,17 @@ if universe_choice == "Custom (নিজে লিখুন)":
     )
     tickers = tuple(sorted(set(t.strip().upper() for t in ticker_text.split(",") if t.strip())))
     source_note = f"কাস্টম লিস্ট থেকে {len(tickers)}টি টিকার নেওয়া হয়েছে।"
+elif universe_choice == "NSE - সব স্টক (Full ~2000, ধীর)":
+    live_list = fetch_full_nse_list()
+    if live_list:
+        tickers = tuple(live_list)
+        source_note = f"✅ NSE-এর সম্পূর্ণ লিস্ট আনা হয়েছে — মোট {len(tickers)}টি স্টক (Series: EQ)।"
+    else:
+        tickers = tuple(FALLBACK_TICKERS)
+        source_note = (
+            "⚠️ NSE থেকে সম্পূর্ণ লিস্ট আনা যায়নি (সাময়িক ব্লক/নেটওয়ার্ক সমস্যা), "
+            f"তাই fallback লিস্ট ({len(tickers)}টি বড় স্টক) ব্যবহার করা হচ্ছে।"
+        )
 else:
     live_list = fetch_index_constituents(universe_choice)
     if live_list:
@@ -279,7 +319,8 @@ st.sidebar.caption(source_note)
 
 if len(tickers) > 200:
     st.sidebar.warning(
-        f"{len(tickers)}টি স্টক স্ক্যান করতে প্রথমবার কয়েক মিনিট সময় লাগতে পারে। "
+        f"{len(tickers)}টি স্টক স্ক্যান করতে প্রথমবার বেশ কয়েক মিনিট সময় লাগতে পারে, এবং Yahoo Finance "
+        "মাঝে মাঝে অতিরিক্ত রিকোয়েস্টে সাময়িক rate-limit করতে পারে (কিছু স্টক তখন স্কিপ হয়ে যাবে)। "
         "ফলাফল ১২ ঘণ্টা cache থাকবে, তাই পরের ভিজিটে সাথে সাথে দেখাবে।"
     )
 
