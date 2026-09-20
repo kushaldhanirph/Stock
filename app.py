@@ -195,6 +195,33 @@ def graham_number(info: dict):
 
 
 # ----------------------------------------------------------------------
+# Market-cap based Large / Mid / Small Cap tagging.
+# NOTE: SEBI's official classification is RANK-based (Large = 1st-100th
+# company by market cap, Mid = 101st-250th, Small = 251st onward) and
+# the exact cutoff values are revised twice a year by AMFI. We don't
+# have a free live feed of that ranking, so this uses commonly-cited
+# approximate value cutoffs instead — good enough to bucket stocks, but
+# a stock near a boundary may be classified slightly differently than
+# the official AMFI list. Edit the two constants below if you have a
+# more current cutoff figure.
+# ----------------------------------------------------------------------
+LARGE_CAP_MIN_CR = 20000   # ₹20,000+ Crore market cap ≈ Large Cap
+MID_CAP_MIN_CR = 5000      # ₹5,000–20,000 Crore ≈ Mid Cap; below ≈ Small Cap
+
+
+def market_cap_category(market_cap):
+    """market_cap is in raw rupees (as yfinance returns it)."""
+    if market_cap is None:
+        return "N/A"
+    cr = market_cap / 1e7
+    if cr >= LARGE_CAP_MIN_CR:
+        return "Large Cap"
+    if cr >= MID_CAP_MIN_CR:
+        return "Mid Cap"
+    return "Small Cap"
+
+
+# ----------------------------------------------------------------------
 # Rule-based BUY / HOLD / SELL tag.
 # This is purely a mechanical read of the Buffett Score + Margin of
 # Safety this app already calculates — NOT personalized financial
@@ -232,10 +259,13 @@ def _fetch_one(t: str):
         gnum = graham_number(info)
         mos = round((gnum - price) / gnum * 100, 1) if gnum else None
         verdict, verdict_color = get_verdict(score, mos)
+        mcap = info.get("marketCap")
         return {
             "Ticker": t.replace(".NS", "").replace(".BO", ""),
             "Name": info.get("shortName", t),
             "Sector": info.get("sector", "N/A"),
+            "Cap Category": market_cap_category(mcap),
+            "Market Cap (₹ Cr)": round(mcap / 1e7, 0) if mcap else None,
             "Price (₹)": round(price, 2),
             "Buffett Score": score,
             "Verdict": verdict,
@@ -326,6 +356,12 @@ if len(tickers) > 200:
 
 min_score = st.sidebar.slider("Minimum Buffett Score", 0, 100, 50)
 only_undervalued = st.sidebar.checkbox("শুধু Margin of Safety > 0 দেখাও (undervalued only)", value=False)
+cap_filter = st.sidebar.multiselect(
+    "Market Cap দিয়ে ফিল্টার করুন",
+    ["Large Cap", "Mid Cap", "Small Cap"],
+    default=["Large Cap", "Mid Cap", "Small Cap"],
+    help=f"আনুমানিক ভাগ: Large Cap ≥ ₹{LARGE_CAP_MIN_CR:,} Cr, Mid Cap ₹{MID_CAP_MIN_CR:,}–{LARGE_CAP_MIN_CR:,} Cr, তার নিচে Small Cap। এটা SEBI/AMFI-এর অফিসিয়াল rank-ভিত্তিক কাট-অফ নয়, একটা কাছাকাছি হিসাব।",
+)
 verdict_filter = st.sidebar.multiselect(
     "Verdict দিয়ে ফিল্টার করুন",
     ["🟢 কেনার মতো (Buy Zone)", "🟡 হোল্ড করুন (Hold Zone)", "🔴 বিক্রি বিবেচনা করুন (Sell Zone)"],
@@ -367,6 +403,8 @@ if only_undervalued:
     filtered = filtered[filtered["Margin of Safety (%)"] > 0]
 if verdict_filter:
     filtered = filtered[filtered["Verdict"].isin(verdict_filter)]
+if cap_filter:
+    filtered = filtered[filtered["Cap Category"].isin(cap_filter)]
 filtered = filtered.sort_values("Buffett Score", ascending=False)
 
 st.markdown(f"**{len(filtered)} / {len(df)}** টি স্টক আপনার ফিল্টার পাস করেছে।")
@@ -379,9 +417,18 @@ c1.metric("🟢 Buy Zone", buy_n)
 c2.metric("🟡 Hold Zone", hold_n)
 c3.metric("🔴 Sell Zone", sell_n)
 
+large_n = (df["Cap Category"] == "Large Cap").sum()
+mid_n = (df["Cap Category"] == "Mid Cap").sum()
+small_n = (df["Cap Category"] == "Small Cap").sum()
+d1, d2, d3 = st.columns(3)
+d1.metric("Large Cap", large_n)
+d2.metric("Mid Cap", mid_n)
+d3.metric("Small Cap", small_n)
+
 display_cols = [
-    "Ticker", "Name", "Sector", "Price (₹)", "Buffett Score", "Verdict",
-    "Graham Value (₹)", "Margin of Safety (%)", "ROE (%)", "D/E", "P/E", "P/B",
+    "Ticker", "Name", "Sector", "Cap Category", "Market Cap (₹ Cr)", "Price (₹)",
+    "Buffett Score", "Verdict", "Graham Value (₹)", "Margin of Safety (%)",
+    "ROE (%)", "D/E", "P/E", "P/B",
 ]
 
 
@@ -400,12 +447,13 @@ st.markdown("### 🔍 বিস্তারিত স্কোর ব্রে�
 pick = st.selectbox("একটা স্টক বেছে নিন বিস্তারিত দেখতে", filtered["Ticker"] if not filtered.empty else df["Ticker"])
 row = df[df["Ticker"] == pick].iloc[0]
 
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("Buffett Score", f"{row['Buffett Score']}/100")
 col2.metric("Current Price", f"₹{row['Price (₹)']}")
 mos_val = row["Margin of Safety (%)"]
 col3.metric("Margin of Safety", f"{mos_val}%" if mos_val is not None else "N/A")
-col4.markdown(f"**Verdict**  \n{row['Verdict']}")
+col4.metric("Cap Category", row["Cap Category"])
+col5.markdown(f"**Verdict**  \n{row['Verdict']}")
 
 with st.expander("এই Verdict কীভাবে হিসাব হলো?"):
     st.markdown(
