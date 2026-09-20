@@ -15,11 +15,14 @@ Deploy for free:
     https://share.streamlit.io  (Streamlit Community Cloud).
 """
 
+import io
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -33,10 +36,55 @@ st.set_page_config(
 )
 
 # ----------------------------------------------------------------------
-# Default watchlist — a broad basket of large & mid cap NSE stocks.
-# Users can edit this list from the sidebar.
+# NSE publishes official index-constituent CSVs (Nifty 50/100/200/500 etc).
+# We fetch these live so the screener covers the REAL, current universe
+# instead of a small hardcoded list. NSE blocks plain requests without
+# browser-like headers, so we open the homepage first to collect cookies.
 # ----------------------------------------------------------------------
-DEFAULT_TICKERS = [
+NSE_INDEX_CSV = {
+    "Nifty 50": "https://archives.nseindia.com/content/indices/ind_nifty50list.csv",
+    "Nifty 100": "https://archives.nseindia.com/content/indices/ind_nifty100list.csv",
+    "Nifty 200": "https://archives.nseindia.com/content/indices/ind_nifty200list.csv",
+    "Nifty 500": "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
+}
+
+NSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)  # index membership changes rarely
+def fetch_index_constituents(universe: str):
+    """Download the official NSE constituent list for a given index and
+    return a sorted list of tickers like 'RELIANCE.NS'. Returns None on
+    failure so the caller can fall back to the bundled list."""
+    url = NSE_INDEX_CSV.get(universe)
+    if not url:
+        return None
+    try:
+        session = requests.Session()
+        session.headers.update(NSE_HEADERS)
+        session.get("https://www.nseindia.com", timeout=10)  # sets cookies
+        resp = session.get(url, timeout=10)
+        resp.raise_for_status()
+        df = pd.read_csv(io.StringIO(resp.text))
+        symbols = df["Symbol"].dropna().astype(str).str.strip()
+        return sorted(f"{s}.NS" for s in symbols if s)
+    except Exception:
+        return None
+
+
+# ----------------------------------------------------------------------
+# Fallback watchlist — used only if the live NSE fetch above fails
+# (e.g. NSE temporarily blocking the request). Users can also switch to
+# "Custom" in the sidebar and paste/edit any list, including BSE tickers
+# with a ".BO" suffix (e.g. 500325.BO for Reliance on BSE).
+# ----------------------------------------------------------------------
+FALLBACK_TICKERS = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
     "HINDUNILVR.NS", "ITC.NS", "SBIN.NS", "BHARTIARTL.NS", "KOTAKBANK.NS",
     "LT.NS", "AXISBANK.NS", "BAJFINANCE.NS", "MARUTI.NS", "ASIANPAINT.NS",
@@ -117,35 +165,81 @@ def graham_number(info: dict):
     return math.sqrt(22.5 * eps * bvps)
 
 
+# ----------------------------------------------------------------------
+# Rule-based BUY / HOLD / SELL tag.
+# This is purely a mechanical read of the Buffett Score + Margin of
+# Safety this app already calculates — NOT personalized financial
+# advice. Thresholds are intentionally conservative and editable below.
+# ----------------------------------------------------------------------
+BUY_SCORE_MIN = 65        # fundamentals strong enough to consider buying
+BUY_MOS_MIN = 15          # and trading at least 15% below intrinsic value
+SELL_SCORE_MAX = 45       # fundamentals weak
+SELL_MOS_MAX = -25        # or trading 25%+ ABOVE intrinsic value (expensive)
+
+
+def get_verdict(score: float, mos):
+    """Return (label, css_color) for the Buy/Hold/Sell tag."""
+    if mos is not None:
+        if score >= BUY_SCORE_MIN and mos > BUY_MOS_MIN:
+            return "🟢 কেনার মতো (Buy Zone)", "#1a7f37"
+        if score < SELL_SCORE_MAX or mos < SELL_MOS_MAX:
+            return "🔴 বিক্রি বিবেচনা করুন (Sell Zone)", "#cf222e"
+        return "🟡 হোল্ড করুন (Hold Zone)", "#9a6700"
+    # No reliable Graham value (e.g. negative EPS) — judge on score alone
+    if score >= 70:
+        return "🟢 কেনার মতো (Buy Zone)", "#1a7f37"
+    if score < 40:
+        return "🔴 বিক্রি বিবেচনা করুন (Sell Zone)", "#cf222e"
+    return "🟡 হোল্ড করুন (Hold Zone)", "#9a6700"
+
+
+def _fetch_one(t: str):
+    try:
+        info = yf.Ticker(t).info
+        price = info.get("currentPrice") or info.get("regularMarketPrice")
+        if not price:
+            return None
+        score, rows = score_stock(info)
+        gnum = graham_number(info)
+        mos = round((gnum - price) / gnum * 100, 1) if gnum else None
+        verdict, verdict_color = get_verdict(score, mos)
+        return {
+            "Ticker": t.replace(".NS", "").replace(".BO", ""),
+            "Name": info.get("shortName", t),
+            "Sector": info.get("sector", "N/A"),
+            "Price (₹)": round(price, 2),
+            "Buffett Score": score,
+            "Verdict": verdict,
+            "Graham Value (₹)": round(gnum, 2) if gnum else None,
+            "Margin of Safety (%)": mos,
+            "ROE (%)": round(info.get("returnOnEquity", 0) * 100, 1) if info.get("returnOnEquity") else None,
+            "D/E": round(info.get("debtToEquity", 0) / 100, 2) if info.get("debtToEquity") is not None else None,
+            "P/E": round(info.get("trailingPE"), 1) if info.get("trailingPE") else None,
+            "P/B": round(info.get("priceToBook"), 2) if info.get("priceToBook") else None,
+            "_rows": rows,
+            "_verdict_color": verdict_color,
+        }
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)  # refresh every 12 hours
-def fetch_data(tickers: tuple):
+def fetch_data(tickers: tuple, max_workers: int = 12):
+    """Fetch fundamentals for all tickers in parallel (much faster than
+    one-by-one, which matters once the universe is 100-500+ stocks)."""
     records = []
-    for i, t in enumerate(tickers):
-        try:
-            info = yf.Ticker(t).info
-            price = info.get("currentPrice") or info.get("regularMarketPrice")
-            if not price:
-                continue
-            score, rows = score_stock(info)
-            gnum = graham_number(info)
-            mos = round((gnum - price) / gnum * 100, 1) if gnum else None
-            records.append({
-                "Ticker": t.replace(".NS", ""),
-                "Name": info.get("shortName", t),
-                "Sector": info.get("sector", "N/A"),
-                "Price (₹)": round(price, 2),
-                "Buffett Score": score,
-                "Graham Value (₹)": round(gnum, 2) if gnum else None,
-                "Margin of Safety (%)": mos,
-                "ROE (%)": round(info.get("returnOnEquity", 0) * 100, 1) if info.get("returnOnEquity") else None,
-                "D/E": round(info.get("debtToEquity", 0) / 100, 2) if info.get("debtToEquity") is not None else None,
-                "P/E": round(info.get("trailingPE"), 1) if info.get("trailingPE") else None,
-                "P/B": round(info.get("priceToBook"), 2) if info.get("priceToBook") else None,
-                "_rows": rows,
-            })
-        except Exception:
-            continue
-        time.sleep(0.15)  # be gentle with the free data API
+    progress = st.progress(0.0, text=f"0 / {len(tickers)} স্টক প্রসেস হয়েছে...")
+    done = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_fetch_one, t): t for t in tickers}
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result:
+                records.append(result)
+            done += 1
+            if done % 5 == 0 or done == len(tickers):
+                progress.progress(done / len(tickers), text=f"{done} / {len(tickers)} স্টক প্রসেস হয়েছে...")
+    progress.empty()
     return pd.DataFrame(records)
 
 
@@ -154,22 +248,55 @@ def fetch_data(tickers: tuple):
 # ----------------------------------------------------------------------
 st.sidebar.header("⚙️ Settings")
 
-ticker_text = st.sidebar.text_area(
-    "NSE Tickers (comma separated, use .NS suffix)",
-    value=", ".join(DEFAULT_TICKERS),
-    height=150,
+universe_choice = st.sidebar.selectbox(
+    "স্টক ইউনিভার্স (কতগুলো স্টক স্ক্যান করবে)",
+    ["Nifty 50", "Nifty 100", "Nifty 200", "Nifty 500", "Custom (নিজে লিখুন)"],
+    index=3,  # default: Nifty 500 — the broadest practical free universe
 )
-tickers = tuple(sorted(set(t.strip().upper() for t in ticker_text.split(",") if t.strip())))
+
+if universe_choice == "Custom (নিজে লিখুন)":
+    ticker_text = st.sidebar.text_area(
+        "Tickers (comma separated). NSE হলে .NS, BSE হলে .BO সাফিক্স দিন",
+        value=", ".join(FALLBACK_TICKERS),
+        height=150,
+    )
+    tickers = tuple(sorted(set(t.strip().upper() for t in ticker_text.split(",") if t.strip())))
+    source_note = f"কাস্টম লিস্ট থেকে {len(tickers)}টি টিকার নেওয়া হয়েছে।"
+else:
+    live_list = fetch_index_constituents(universe_choice)
+    if live_list:
+        tickers = tuple(live_list)
+        source_note = f"✅ NSE থেকে লাইভ **{universe_choice}** লিস্ট আনা হয়েছে — মোট {len(tickers)}টি স্টক।"
+    else:
+        tickers = tuple(FALLBACK_TICKERS)
+        source_note = (
+            f"⚠️ NSE থেকে লাইভ {universe_choice} লিস্ট আনা যায়নি (সাময়িক ব্লক/নেটওয়ার্ক সমস্যা), "
+            f"তাই বিল্ট-ইন fallback লিস্ট ({len(tickers)}টি বড় স্টক) ব্যবহার করা হচ্ছে। "
+            "'Force refresh' চেপে আবার চেষ্টা করে দেখুন।"
+        )
+
+st.sidebar.caption(source_note)
+
+if len(tickers) > 200:
+    st.sidebar.warning(
+        f"{len(tickers)}টি স্টক স্ক্যান করতে প্রথমবার কয়েক মিনিট সময় লাগতে পারে। "
+        "ফলাফল ১২ ঘণ্টা cache থাকবে, তাই পরের ভিজিটে সাথে সাথে দেখাবে।"
+    )
 
 min_score = st.sidebar.slider("Minimum Buffett Score", 0, 100, 50)
 only_undervalued = st.sidebar.checkbox("শুধু Margin of Safety > 0 দেখাও (undervalued only)", value=False)
+verdict_filter = st.sidebar.multiselect(
+    "Verdict দিয়ে ফিল্টার করুন",
+    ["🟢 কেনার মতো (Buy Zone)", "🟡 হোল্ড করুন (Hold Zone)", "🔴 বিক্রি বিবেচনা করুন (Sell Zone)"],
+    default=["🟢 কেনার মতো (Buy Zone)", "🟡 হোল্ড করুন (Hold Zone)", "🔴 বিক্রি বিবেচনা করুন (Sell Zone)"],
+)
 
 if st.sidebar.button("🔄 Force refresh data now"):
     st.cache_data.clear()
 
 st.sidebar.caption(
     "ডেটা প্রতি ১২ ঘণ্টায় স্বয়ংক্রিয়ভাবে refresh হয় (cache TTL)। "
-    "সোর্স: Yahoo Finance (yfinance), সম্পূর্ণ ফ্রি।"
+    "সোর্স: NSE (স্টক লিস্ট) + Yahoo Finance/yfinance (ফান্ডামেন্টাল ডেটা), সম্পূর্ণ ফ্রি।"
 )
 
 # ----------------------------------------------------------------------
@@ -191,16 +318,33 @@ if df.empty:
 filtered = df[df["Buffett Score"] >= min_score]
 if only_undervalued:
     filtered = filtered[filtered["Margin of Safety (%)"] > 0]
+if verdict_filter:
+    filtered = filtered[filtered["Verdict"].isin(verdict_filter)]
 filtered = filtered.sort_values("Buffett Score", ascending=False)
 
 st.markdown(f"**{len(filtered)} / {len(df)}** টি স্টক আপনার ফিল্টার পাস করেছে।")
 
+buy_n = (df["Verdict"].str.contains("Buy")).sum()
+hold_n = (df["Verdict"].str.contains("Hold")).sum()
+sell_n = (df["Verdict"].str.contains("Sell")).sum()
+c1, c2, c3 = st.columns(3)
+c1.metric("🟢 Buy Zone", buy_n)
+c2.metric("🟡 Hold Zone", hold_n)
+c3.metric("🔴 Sell Zone", sell_n)
+
 display_cols = [
-    "Ticker", "Name", "Sector", "Price (₹)", "Buffett Score",
+    "Ticker", "Name", "Sector", "Price (₹)", "Buffett Score", "Verdict",
     "Graham Value (₹)", "Margin of Safety (%)", "ROE (%)", "D/E", "P/E", "P/B",
 ]
+
+
+def _highlight_verdict(row):
+    color = "#1a7f37" if "Buy" in row["Verdict"] else "#cf222e" if "Sell" in row["Verdict"] else "#9a6700"
+    return [f"color: {color}; font-weight: 600" if col == "Verdict" else "" for col in row.index]
+
+
 st.dataframe(
-    filtered[display_cols].reset_index(drop=True),
+    filtered[display_cols].reset_index(drop=True).style.apply(_highlight_verdict, axis=1),
     use_container_width=True,
     height=480,
 )
@@ -209,16 +353,28 @@ st.markdown("### 🔍 বিস্তারিত স্কোর ব্রে�
 pick = st.selectbox("একটা স্টক বেছে নিন বিস্তারিত দেখতে", filtered["Ticker"] if not filtered.empty else df["Ticker"])
 row = df[df["Ticker"] == pick].iloc[0]
 
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 col1.metric("Buffett Score", f"{row['Buffett Score']}/100")
 col2.metric("Current Price", f"₹{row['Price (₹)']}")
 mos_val = row["Margin of Safety (%)"]
 col3.metric("Margin of Safety", f"{mos_val}%" if mos_val is not None else "N/A")
+col4.markdown(f"**Verdict**  \n{row['Verdict']}")
+
+with st.expander("এই Verdict কীভাবে হিসাব হলো?"):
+    st.markdown(
+        f"""
+- 🟢 **Buy Zone**: Buffett Score ≥ {BUY_SCORE_MIN} এবং Margin of Safety > {BUY_MOS_MIN}% (মানে দাম Intrinsic Value থেকে অন্তত {BUY_MOS_MIN}% কম)
+- 🔴 **Sell Zone**: Buffett Score < {SELL_SCORE_MAX} অথবা দাম Intrinsic Value থেকে {abs(SELL_MOS_MAX)}%+ বেশি (overvalued)
+- 🟡 **Hold Zone**: বাকি সব ক্ষেত্রে — ফান্ডামেন্টাল মোটামুটি ভালো কিন্তু দাম fair value-এর কাছাকাছি
+        """
+    )
 
 detail_df = pd.DataFrame(row["_rows"], columns=["Criterion", "Value", "Points", "Max"])
 st.table(detail_df)
 
 st.caption(
     f"সর্বশেষ ডেটা আপডেট (cache): {datetime.now().strftime('%Y-%m-%d %H:%M')} | "
-    "⚠️ এটি শিক্ষামূলক টুল, বিনিয়োগ পরামর্শ নয়। কেনার আগে নিজে গবেষণা করুন বা SEBI-নিবন্ধিত উপদেষ্টার পরামর্শ নিন।"
+    "⚠️ Buy/Hold/Sell ট্যাগটি সম্পূর্ণ একটি নিয়ম-ভিত্তিক (rule-based) হিসাব — শুধু Buffett Score ও "
+    "Margin of Safety-এর উপর ভিত্তি করে তৈরি, ব্যক্তিগত বিনিয়োগ পরামর্শ নয়। কেনা-বেচার আগে নিজে গবেষণা "
+    "করুন বা SEBI-নিবন্ধিত উপদেষ্টার পরামর্শ নিন।"
 )
