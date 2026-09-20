@@ -279,8 +279,8 @@ st.sidebar.header("⚙️ Settings")
 
 universe_choice = st.sidebar.selectbox(
     "স্টক ইউনিভার্স (কতগুলো স্টক স্ক্যান করবে)",
-    ["Nifty 50", "Nifty 100", "Nifty 200", "Nifty 500", "NSE - সব স্টক (Full ~2000, ধীর)", "Custom (নিজে লিখুন)"],
-    index=3,  # default: Nifty 500 — the broadest FAST practical universe
+    ["NSE - সব স্টক (Full ~2000, ধীর)", "Nifty 500", "Nifty 200", "Nifty 100", "Nifty 50", "Custom (নিজে লিখুন)"],
+    index=0,  # default: the full NSE list, since that's what most people expect
 )
 
 if universe_choice == "Custom (নিজে লিখুন)":
@@ -351,6 +351,12 @@ st.caption(
 
 with st.spinner("লাইভ ডেটা আনা হচ্ছে... (প্রথমবার একটু সময় লাগতে পারে)"):
     df = fetch_data(tickers)
+
+st.info(
+    f"📋 এখন সিলেক্টেড ইউনিভার্স: **{universe_choice}** — লিস্টে মোট **{len(tickers)}**টি টিকার ছিল, "
+    f"যার মধ্যে **{len(df)}**টি স্টকের ডেটা সফলভাবে পাওয়া গেছে। "
+    "(ভিন্ন সংখ্যা চাইলে সাইডবারের 'স্টক ইউনিভার্স' ড্রপডাউন থেকে বদলে নিন।)"
+)
 
 if df.empty:
     st.error("কোনো ডেটা পাওয়া যায়নি। টিকার লিস্ট চেক করুন অথবা কিছুক্ষণ পর আবার চেষ্টা করুন।")
