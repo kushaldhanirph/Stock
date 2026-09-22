@@ -250,16 +250,47 @@ def get_verdict(score: float, mos):
     return "🟡 হোল্ড করুন (Hold Zone)", "#9a6700"
 
 
+def _get_price(t: str, yf_ticker: "yf.Ticker", info: dict):
+    """Price lookup with fallbacks, cheapest/most-reliable source first.
+    yfinance's `.info` dict (used below for fundamentals) hits Yahoo's
+    heaviest, most rate-limited endpoint and is often missing/blocked —
+    `fast_info` hits a much lighter endpoint and rarely fails, so we try
+    that first instead of giving up on the whole stock when `.info`
+    lacks a price. Key names vary slightly across yfinance versions, so
+    both dict-style and attribute-style access are tried.
+    """
+    try:
+        fi = yf_ticker.fast_info
+        for key in ("last_price", "lastPrice", "regular_market_price", "regularMarketPrice"):
+            val = None
+            try:
+                val = fi[key]
+            except Exception:
+                val = getattr(fi, key, None)
+            if val:
+                return float(val)
+    except Exception:
+        pass
+    p = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
+    return float(p) if p else None
+
+
 def _fetch_one(t: str, retries: int = 0):
     """retries>0 adds a short pre-request delay, used for the second
     (slower, gentler) retry pass so we don't hammer Yahoo again the same way."""
     if retries:
         time.sleep(0.5 * retries + random.uniform(0, 0.5))
     try:
-        info = yf.Ticker(t).info
-        price = info.get("currentPrice") or info.get("regularMarketPrice")
+        yf_ticker = yf.Ticker(t)
+        try:
+            info = yf_ticker.info or {}
+        except Exception:
+            info = {}  # fundamentals endpoint failed — still try to get at least a price below
+
+        price = _get_price(t, yf_ticker, info)
         if not price:
             return None
+
         score, rows = score_stock(info)
         gnum = graham_number(info)
         mos = round((gnum - price) / gnum * 100, 1) if gnum else None
@@ -267,7 +298,7 @@ def _fetch_one(t: str, retries: int = 0):
         mcap = info.get("marketCap")
         return {
             "Ticker": t.replace(".NS", "").replace(".BO", ""),
-            "Name": info.get("shortName", t),
+            "Name": info.get("shortName") or t,
             "Sector": info.get("sector", "N/A"),
             "Cap Category": market_cap_category(mcap),
             "Market Cap (₹ Cr)": round(mcap / 1e7, 0) if mcap else None,
@@ -291,7 +322,7 @@ def _fetch_one(t: str, retries: int = 0):
 # (new/renamed/removed columns). Passing it into fetch_data's cache key
 # guarantees Streamlit invalidates any old cached results automatically,
 # instead of silently reusing a DataFrame with a different schema.
-DATA_SCHEMA_VERSION = 2
+DATA_SCHEMA_VERSION = 3
 
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)  # refresh every 12 hours
