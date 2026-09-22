@@ -17,6 +17,7 @@ Deploy for free:
 
 import io
 import math
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -249,7 +250,11 @@ def get_verdict(score: float, mos):
     return "🟡 হোল্ড করুন (Hold Zone)", "#9a6700"
 
 
-def _fetch_one(t: str):
+def _fetch_one(t: str, retries: int = 0):
+    """retries>0 adds a short pre-request delay, used for the second
+    (slower, gentler) retry pass so we don't hammer Yahoo again the same way."""
+    if retries:
+        time.sleep(0.5 * retries + random.uniform(0, 0.5))
     try:
         info = yf.Ticker(t).info
         price = info.get("currentPrice") or info.get("regularMarketPrice")
@@ -290,21 +295,44 @@ DATA_SCHEMA_VERSION = 2
 
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)  # refresh every 12 hours
-def fetch_data(tickers: tuple, max_workers: int = 12, schema_version: int = DATA_SCHEMA_VERSION):
-    """Fetch fundamentals for all tickers in parallel (much faster than
-    one-by-one, which matters once the universe is 100-500+ stocks)."""
+def fetch_data(tickers: tuple, max_workers: int = 8, schema_version: int = DATA_SCHEMA_VERSION):
+    """Fetch fundamentals for all tickers in parallel. Yahoo Finance
+    (yfinance's free data source) sometimes rate-limits a burst of
+    parallel requests, silently failing a chunk of tickers on the first
+    pass — so any that fail get a couple of gentler, slower retries
+    afterwards instead of being dropped outright."""
     records = []
-    progress = st.progress(0.0, text=f"0 / {len(tickers)} স্টক প্রসেস হয়েছে...")
+    total = len(tickers)
+    progress = st.progress(0.0, text=f"0 / {total} স্টক প্রসেস হয়েছে...")
     done = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_fetch_one, t): t for t in tickers}
-        for fut in as_completed(futures):
-            result = fut.result()
-            if result:
-                records.append(result)
-            done += 1
-            if done % 5 == 0 or done == len(tickers):
-                progress.progress(done / len(tickers), text=f"{done} / {len(tickers)} স্টক প্রসেস হয়েছে...")
+
+    def _run_pass(ticker_list, workers, retry_num, label):
+        nonlocal done
+        failed = []
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_fetch_one, t, retry_num): t for t in ticker_list}
+            for fut in as_completed(futures):
+                t = futures[fut]
+                result = fut.result()
+                if result:
+                    records.append(result)
+                else:
+                    failed.append(t)
+                done += 1
+                if done % 5 == 0 or done == total:
+                    progress.progress(min(done / total, 1.0), text=f"{label}: {done} স্টক প্রসেস হয়েছে...")
+        return failed
+
+    failed = _run_pass(tickers, max_workers, 0, f"0 / {total} স্টক প্রসেস হয়েছে")
+
+    # Retry failures up to twice, slower and gentler each time, so a
+    # temporary rate-limit doesn't permanently drop a stock from results.
+    for retry_num in (1, 2):
+        if not failed:
+            break
+        done = total - len(failed)  # so the progress bar reflects the retry subset
+        failed = _run_pass(failed, max(2, max_workers // 2), retry_num, f"পুনরায় চেষ্টা #{retry_num}")
+
     progress.empty()
     return pd.DataFrame(records)
 
